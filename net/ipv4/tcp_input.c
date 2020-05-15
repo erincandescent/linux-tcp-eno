@@ -3688,6 +3688,11 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 	sk->sk_err_soft = 0;
 	icsk->icsk_probes_out = 0;
 	tp->rcv_tstamp = tcp_jiffies32;
+	
+	/* If ENO is enabled, mark it as established */
+	if (tp->eno_info && tp->eno_info->enabled)
+		tp->eno_info->established = 1;
+
 	if (!prior_packets)
 		goto no_queue;
 
@@ -3839,7 +3844,8 @@ static u16 tcp_parse_mss_option(const struct tcphdr *th, u16 user_mss)
 void tcp_parse_options(const struct net *net,
 		       const struct sk_buff *skb,
 		       struct tcp_options_received *opt_rx, int estab,
-		       struct tcp_fastopen_cookie *foc)
+		       struct tcp_fastopen_cookie *foc,
+		       u8 **eno_op)
 {
 	const unsigned char *ptr;
 	const struct tcphdr *th = tcp_hdr(skb);
@@ -3847,6 +3853,8 @@ void tcp_parse_options(const struct net *net,
 
 	ptr = (const unsigned char *)(th + 1);
 	opt_rx->saw_tstamp = 0;
+	if (eno_op)
+		*eno_op = NULL;
 
 	while (length > 0) {
 		int opcode = *ptr++;
@@ -3931,6 +3939,12 @@ void tcp_parse_options(const struct net *net,
 					ptr, th->syn, foc, false);
 				break;
 
+			case TCPOPT_ENO:
+				 if (eno_op && opsize <= TCPOLEN_ENO_MAX) {
+				 	*eno_op = ptr - 2;
+				 }
+				 break;
+
 			case TCPOPT_EXP:
 				/* Fast Open option shares code 254 using a
 				 * 16 bits magic number.
@@ -3945,7 +3959,6 @@ void tcp_parse_options(const struct net *net,
 					smc_parse_options(th, opt_rx, ptr,
 							  opsize);
 				break;
-
 			}
 			ptr += opsize-2;
 			length -= opsize;
@@ -3992,7 +4005,7 @@ static bool tcp_fast_parse_options(const struct net *net,
 			return true;
 	}
 
-	tcp_parse_options(net, skb, &tp->rx_opt, 1, NULL);
+	tcp_parse_options(net, skb, &tp->rx_opt, 1, NULL, NULL);
 	if (tp->rx_opt.saw_tstamp && tp->rx_opt.rcv_tsecr)
 		tp->rx_opt.rcv_tsecr -= tp->tsoffset;
 
@@ -5794,7 +5807,7 @@ static bool tcp_rcv_fastopen_synack(struct sock *sk, struct sk_buff *synack,
 		/* Get original SYNACK MSS value if user MSS sets mss_clamp */
 		tcp_clear_options(&opt);
 		opt.user_mss = opt.mss_clamp = 0;
-		tcp_parse_options(sock_net(sk), synack, &opt, 0, NULL);
+		tcp_parse_options(sock_net(sk), synack, &opt, 0, NULL, NULL);
 		mss = opt.mss_clamp;
 	}
 
@@ -5872,10 +5885,11 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct tcp_fastopen_cookie foc = { .len = -1 };
+	u8 *eno_op;
 	int saved_clamp = tp->rx_opt.mss_clamp;
 	bool fastopen_fail;
 
-	tcp_parse_options(sock_net(sk), skb, &tp->rx_opt, 0, &foc);
+	tcp_parse_options(sock_net(sk), skb, &tp->rx_opt, 0, &foc, &eno_op);
 	if (tp->rx_opt.saw_tstamp && tp->rx_opt.rcv_tsecr)
 		tp->rx_opt.rcv_tsecr -= tp->tsoffset;
 
@@ -5973,6 +5987,21 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
 		smc_check_reset_syn(tp);
 
 		smp_mb();
+
+		/* If both parties provided equal ENO options, and they are compatible,
+		 * enable ENO
+		 */
+		if (eno_op) {
+			if (!tp->eno_info) {
+				printk("ENO option but not enabled on our side\n");
+			} else if(tcp_eno_can_enable(tp->eno_info->our_opt, eno_op)) {
+				printk("ENO option and compatible, enabling\n");
+				memcpy(tp->eno_info->peer_opt, eno_op, eno_op[1]);
+				tp->eno_info->enabled = true;
+			} else {
+				printk("ENO option but not compatible\n");
+			}
+		}
 
 		tcp_finish_connect(sk, skb);
 
@@ -6559,6 +6588,7 @@ int tcp_conn_request(struct request_sock_ops *rsk_ops,
 		     struct sock *sk, struct sk_buff *skb)
 {
 	struct tcp_fastopen_cookie foc = { .len = -1 };
+	u8 *eno_op = NULL;
 	__u32 isn = TCP_SKB_CB(skb)->tcp_tw_isn;
 	struct tcp_options_received tmp_opt;
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -6596,7 +6626,7 @@ int tcp_conn_request(struct request_sock_ops *rsk_ops,
 	tmp_opt.mss_clamp = af_ops->mss_clamp;
 	tmp_opt.user_mss  = tp->rx_opt.user_mss;
 	tcp_parse_options(sock_net(sk), skb, &tmp_opt, 0,
-			  want_cookie ? NULL : &foc);
+			  want_cookie ? NULL : &foc, want_cookie ? NULL : &eno_op);
 
 	if (want_cookie && !tmp_opt.saw_tstamp)
 		tcp_clear_options(&tmp_opt);
@@ -6676,6 +6706,25 @@ int tcp_conn_request(struct request_sock_ops *rsk_ops,
 		sock_put(fastopen_sk);
 	} else {
 		tcp_rsk(req)->tfo_listener = false;
+		/* If both we and our counterpart are enabling ENO, enable it on this 
+		 * socket
+		 */
+		if (eno_op) {
+			if (!tp->eno_info) {
+				printk("ENO requested by counterparty but not enabled by us\n");
+			} else if (tcp_eno_can_enable(tp->eno_info->our_opt, eno_op)) {
+				printk("ENO options compatible; enabling\n");
+				struct tcp_eno_info *eno_info = 
+					kmemdup(tp->eno_info, sizeof(*eno_info), sk->sk_allocation);
+				eno_info->enabled = 1;
+				memcpy(eno_info->peer_opt, eno_op, eno_op[1]);
+
+				tcp_rsk(req)->eno_info = eno_info;
+			} else {
+				printk("ENO options incompatible\n");
+			}
+		}
+
 		if (!want_cookie)
 			inet_csk_reqsk_queue_hash_add(sk, req,
 				tcp_timeout_init((struct sock *)req));

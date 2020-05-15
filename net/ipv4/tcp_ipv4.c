@@ -971,6 +971,7 @@ static int tcp_v4_send_synack(const struct sock *sk, struct dst_entry *dst,
  */
 static void tcp_v4_reqsk_destructor(struct request_sock *req)
 {
+	kfree(tcp_rsk(req)->eno_info);
 	kfree(rcu_dereference_protected(inet_rsk(req)->ireq_opt, 1));
 }
 
@@ -2119,6 +2120,8 @@ void tcp_v4_destroy_sock(struct sock *sk)
 		tp->md5sig_info = NULL;
 	}
 #endif
+
+	kfree(tp->eno_info);
 
 	/* Clean up a referenced TCP bind bucket. */
 	if (inet_csk(sk)->icsk_bind_hash)

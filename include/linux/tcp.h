@@ -128,6 +128,7 @@ struct tcp_request_sock {
 						  * FastOpen it's the seq#
 						  * after data-in-SYN.
 						  */
+	struct tcp_eno_info             *eno_info;
 };
 
 static inline struct tcp_request_sock *tcp_rsk(const struct request_sock *req)
@@ -395,6 +396,11 @@ struct tcp_sock {
 	 */
 	struct request_sock __rcu *fastopen_rsk;
 	u32	*saved_syn;
+
+	/* TCP Encryption Negotiation Option related information 
+	 * If ENO is enabled on a socket, this will be non-NULL
+	 */
+	struct tcp_eno_info *eno_info;
 };
 
 enum tsq_enum {

@@ -412,6 +412,7 @@ static inline bool tcp_urg_mode(const struct tcp_sock *tp)
 #define OPTION_TS		(1 << 1)
 #define OPTION_MD5		(1 << 2)
 #define OPTION_WSCALE		(1 << 3)
+#define OPTION_ENO		(1 << 4)
 #define OPTION_FAST_OPEN_COOKIE	(1 << 8)
 #define OPTION_SMC		(1 << 9)
 
@@ -439,6 +440,7 @@ struct tcp_out_options {
 	__u8 *hash_location;	/* temporary pointer, overloaded */
 	__u32 tsval, tsecr;	/* need to include OPTION_TS */
 	struct tcp_fastopen_cookie *fastopen_cookie;	/* Fast open cookie */
+	const __u8 *eno_op;
 };
 
 /* Write previously computed TCP options to the packet.
@@ -549,6 +551,32 @@ static void tcp_options_write(__be32 *ptr, struct tcp_sock *tp,
 	}
 
 	smc_options_write(ptr, &options);
+
+
+	if (unlikely(OPTION_ENO & options)) {
+		u8 *p = (u8 *)ptr;
+		u32 len;
+
+		/* If we were passed a pre-prepared buffer, splat it out
+		 * Otherwise, we are emitting an empty option (eno enabled but
+		 * not established yet)
+		 */
+		if (opts->eno_op) {
+			len = opts->eno_op[1];
+			memcpy(p, opts->eno_op, len);
+		} else {
+			p[0] = TCPOPT_ENO;
+			p[1] = TCPOLEN_ENO_BASE;
+			len = 2;
+		}
+
+		/* Pad to a multiple of 4 */
+		while (len & 3) {
+			p[len++] = TCPOPT_NOP;
+		}
+		
+		ptr +=len >> 2;
+	}
 }
 
 static void smc_set_option(const struct tcp_sock *tp,
@@ -594,6 +622,7 @@ static unsigned int tcp_syn_options(struct sock *sk, struct sk_buff *skb,
 	struct tcp_sock *tp = tcp_sk(sk);
 	unsigned int remaining = MAX_TCP_OPTION_SPACE;
 	struct tcp_fastopen_request *fastopen = tp->fastopen_req;
+	struct tcp_eno_info *eno = tp->eno_info;
 
 	*md5 = NULL;
 #ifdef CONFIG_TCP_MD5SIG
@@ -636,7 +665,35 @@ static unsigned int tcp_syn_options(struct sock *sk, struct sk_buff *skb,
 			remaining -= TCPOLEN_SACKPERM_ALIGNED;
 	}
 
-	if (fastopen && fastopen->cookie.len >= 0) {
+
+	/* Attempt to include an ENO option if the app has requested it.
+	 */
+	if (eno && eno->our_opt[1] > 0) {
+		u32 need = (eno->our_opt[1] + 3) & ~3U;
+		if (remaining >= need) {
+			printk("Adding ENO option [%p]\n");
+			opts->options |= OPTION_ENO;
+			opts->eno_op = eno->our_opt;
+			remaining -= need;
+		} else {
+			/* update our option value to indicate we disabled ENO */
+			printk("Disabling ENO option due to insufficient space [%p]\n");
+			eno->our_opt[1] = 0;
+			eno->enabled = 0;
+		}
+	}
+
+	/* RFC 8547 s4.7.  Data in SYN Segments:
+	 * A host sending a SYN+ENO segment MUST NOT include data in the segment
+         * unless the SYN TEP's specification defines the use of such data.
+         * Furthermore, to avoid conflicting interpretations of SYN data, a
+         * SYN+ENO segment MUST NOT include a non-empty TCP Fast Open (TFO)
+         * option [RFC7413].
+         * 
+         *
+         * If we're sending an ENO option, suppress Fast Open
+         */
+	if (fastopen && fastopen->cookie.len >= 0 && !(opts->options & OPTION_ENO)) {
 		u32 need = fastopen->cookie.len;
 
 		need += fastopen->cookie.exp ? TCPOLEN_EXP_FASTOPEN_BASE :
@@ -665,6 +722,7 @@ static unsigned int tcp_synack_options(const struct sock *sk,
 				       struct tcp_fastopen_cookie *foc)
 {
 	struct inet_request_sock *ireq = inet_rsk(req);
+	struct tcp_eno_info *eno = tcp_rsk(req)->eno_info;
 	unsigned int remaining = MAX_TCP_OPTION_SPACE;
 
 #ifdef CONFIG_TCP_MD5SIG
@@ -701,7 +759,24 @@ static unsigned int tcp_synack_options(const struct sock *sk,
 		if (unlikely(!ireq->tstamp_ok))
 			remaining -= TCPOLEN_SACKPERM_ALIGNED;
 	}
-	if (foc != NULL && foc->len >= 0) {
+
+	if (eno) {
+		u32 need = (eno->our_opt[1] + 3) & ~3U;
+		if (remaining >= need) {
+			printk("Putting ENO option in SYNACK\n");
+			opts->options |= OPTION_ENO;		
+			opts->eno_op = eno->our_opt;
+			remaining -= need;
+		} else {
+			/* update our option value to indicate we disabled ENO */
+			printk("disabling ENO due to insufficient space\n");
+			eno->our_opt[1] = 0;
+		}
+	} else {
+		printk("no local eno option configured\n");
+	}
+
+	if (foc != NULL && foc->len >= 0 && !(opts->options & OPTION_ENO)) {
 		u32 need = foc->len;
 
 		need += foc->exp ? TCPOLEN_EXP_FASTOPEN_BASE :
@@ -727,6 +802,7 @@ static unsigned int tcp_established_options(struct sock *sk, struct sk_buff *skb
 					struct tcp_md5sig_key **md5)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
+	struct tcp_eno_info *eno = tp->eno_info;
 	unsigned int size = 0;
 	unsigned int eff_sacks;
 
@@ -761,6 +837,15 @@ static unsigned int tcp_established_options(struct sock *sk, struct sk_buff *skb
 		if (likely(opts->num_sack_blocks))
 			size += TCPOLEN_SACK_BASE_ALIGNED +
 				opts->num_sack_blocks * TCPOLEN_SACK_PERBLOCK;
+	}
+
+	/* If we have enabled ENO but not yet established it, then include an 
+	 * ENO option
+	 */
+	if (unlikely(eno && eno->enabled && !eno->established)) {
+		opts->options |= OPTION_ENO;
+		opts->eno_op = NULL;
+		size += TCPOLEN_ENO_BASE_ALIGNED;
 	}
 
 	return size;

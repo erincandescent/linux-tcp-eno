@@ -3144,11 +3144,46 @@ static int do_tcp_setsockopt(struct sock *sk, int level,
 			tcp_enable_tx_delay();
 		tp->tcp_tx_delay = val;
 		break;
+
+	case TCP_ENO_RAW: {
+		u8 val[TCP_ENO_OPT_VAL_MAX_LEN];
+		
+		if (optlen > TCP_ENO_OPT_VAL_MAX_LEN) {
+			err = -EINVAL;
+			goto out;
+		}
+
+		if (sk->sk_state != TCP_CLOSE && sk->sk_state != TCP_LISTEN) {
+			err = -EISCONN;
+			goto out;
+		}
+
+		if (copy_from_user(val, optval, optlen)) {
+			err = -EFAULT;
+			goto out;
+		} 
+
+		if (!tp->eno_info) {
+			tp->eno_info = kzalloc(sizeof(struct tcp_eno_info), sk->sk_allocation);
+			if (!tp->eno_info) {
+				err = -ENOMEM;
+				goto out;
+			}
+		}
+
+		tp->eno_info->our_opt[0] = TCPOPT_ENO;
+		tp->eno_info->our_opt[1] = optlen + TCPOLEN_ENO_BASE;
+		memcpy(&tp->eno_info->our_opt[2], val, optlen);
+
+		break;
+	}
+
 	default:
 		err = -ENOPROTOOPT;
 		break;
 	}
 
+out:
 	release_sock(sk);
 	return err;
 }
@@ -3673,6 +3708,43 @@ static int do_tcp_getsockopt(struct sock *sk, int level,
 		return err;
 	}
 #endif
+	case TCP_ENO_RAW:
+	case TCP_ENO_RAW_PEER: {
+		int err = 0;
+
+		if (get_user(len, optlen))
+			return -EFAULT;
+
+		lock_sock(sk);
+
+		if (!tp->eno_info) {
+			len = 0;
+		} else if (optname == TCP_ENO_RAW_PEER && !tp->eno_info->enabled) {
+			len = 0;
+			err = -ENOTCONN;
+		} else {
+			u8 *opt = optname == TCP_ENO_RAW_PEER ? tp->eno_info->peer_opt : tp->eno_info->our_opt;
+			unsigned body_len = opt[1] ? opt[1] - TCPOLEN_ENO_BASE : 0;
+
+			if (len < body_len) {
+				err = -EINVAL;
+			}
+
+			len = body_len;
+
+			if (!err && copy_to_user(optval, &opt[2], len)) {
+				err = -EFAULT;
+			}
+		}
+
+		if (put_user(len, optlen)) {
+			err = -EFAULT;
+		}
+
+		release_sock(sk);
+		return err;
+	}
+
 	default:
 		return -ENOPROTOOPT;
 	}

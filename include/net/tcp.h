@@ -183,6 +183,7 @@ void tcp_time_wait(struct sock *sk, int state, int timeo);
 #define TCPOPT_TIMESTAMP	8	/* Better RTT estimations/PAWS */
 #define TCPOPT_MD5SIG		19	/* MD5 Signature (RFC2385) */
 #define TCPOPT_FASTOPEN		34	/* Fast open (RFC7413) */
+#define TCPOPT_ENO              69      /* Encryption Negotiation Option */
 #define TCPOPT_EXP		254	/* Experimental */
 /* Magic number to be after the option value for sharing TCP
  * experimental options. See draft-ietf-tcpm-experimental-options-00.txt
@@ -202,6 +203,8 @@ void tcp_time_wait(struct sock *sk, int state, int timeo);
 #define TCPOLEN_FASTOPEN_BASE  2
 #define TCPOLEN_EXP_FASTOPEN_BASE  4
 #define TCPOLEN_EXP_SMC_BASE   6
+#define TCPOLEN_ENO_BASE 2
+#define TCPOLEN_ENO_MAX 40
 
 /* But this is what stacks really send out. */
 #define TCPOLEN_TSTAMP_ALIGNED		12
@@ -213,6 +216,7 @@ void tcp_time_wait(struct sock *sk, int state, int timeo);
 #define TCPOLEN_MD5SIG_ALIGNED		20
 #define TCPOLEN_MSS_ALIGNED		4
 #define TCPOLEN_EXP_SMC_BASE_ALIGNED	8
+#define TCPOLEN_ENO_BASE_ALIGNED	4
 
 /* Flags in tp->nonagle */
 #define TCP_NAGLE_OFF		1	/* Nagle's algo is disabled */
@@ -411,7 +415,7 @@ int tcp_mmap(struct file *file, struct socket *sock,
 #endif
 void tcp_parse_options(const struct net *net, const struct sk_buff *skb,
 		       struct tcp_options_received *opt_rx,
-		       int estab, struct tcp_fastopen_cookie *foc);
+		       int estab, struct tcp_fastopen_cookie *foc, u8 **eno);
 const u8 *tcp_parse_md5sig_option(const struct tcphdr *th);
 
 /*
@@ -1537,6 +1541,38 @@ struct tcp_md5sig_info {
 	struct hlist_head	head;
 	struct rcu_head		rcu;
 };
+
+/* TCP ENO (Encryption Negotiation Option) Information */
+#define TCP_ENO_OPT_VAL_MAX_LEN (TCPOLEN_ENO_MAX - TCPOLEN_ENO_BASE)
+#define TCP_ENO_GSO_PARTY_B   0x01
+#define TCP_ENO_GSO_APP_AWARE 0x02
+
+struct tcp_eno_info { 
+	/* u8 required : 1;  ENO required - fail if negotiation fails */
+	/* ENO enabled on this socket:
+	 * Both parties sent compatible TEPs 
+	 */
+	u8 enabled     : 1,
+	/* ENO established on this socket:
+	 * ENO was enabled, and ACKs echanged
+	 */
+	   established : 1;
+
+	/* The full options (type byte included) */
+	/* If we have not yet sent our SYN, the value that userspace has asked
+	 * us to send for the ENO option.
+	 *
+	 * If we have sent our SYN, the value that we actually sent. When we are
+	 * the passive side (listening socket), 
+	 */ 
+	u8 our_opt[TCPOLEN_ENO_MAX];
+
+	/* The peer's SYN ENO option */
+	u8 peer_opt[TCPOLEN_ENO_MAX];
+};
+
+u8 tcp_eno_can_enable(const u8 *our_opt, const u8 *their_opt);
+u8 tcp_eno_global_subopt(const u8 *opt);
 
 /* - pseudo header */
 struct tcp4_pseudohdr {

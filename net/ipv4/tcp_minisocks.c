@@ -98,7 +98,7 @@ tcp_timewait_state_process(struct inet_timewait_sock *tw, struct sk_buff *skb,
 
 	tmp_opt.saw_tstamp = 0;
 	if (th->doff > (sizeof(*th) >> 2) && tcptw->tw_ts_recent_stamp) {
-		tcp_parse_options(twsk_net(tw), skb, &tmp_opt, 0, NULL);
+		tcp_parse_options(twsk_net(tw), skb, &tmp_opt, 0, NULL, NULL);
 
 		if (tmp_opt.saw_tstamp) {
 			if (tmp_opt.rcv_tsecr)
@@ -541,6 +541,13 @@ struct sock *tcp_create_openreq_child(const struct sock *sk,
 	if (newtp->af_specific->md5_lookup(sk, newsk))
 		newtp->tcp_header_len += TCPOLEN_MD5SIG_ALIGNED;
 #endif
+
+	if (treq->eno_info && treq->eno_info->established) {
+		printk("ReqSock has established ENO, transferring to actual sock [%p]\n", treq->eno_info);
+		newtp->eno_info = treq->eno_info;
+		treq->eno_info = NULL;
+	}
+
 	if (skb->len >= TCP_MSS_DEFAULT + newtp->tcp_header_len)
 		newicsk->icsk_ack.last_seg_size = skb->len - newtp->tcp_header_len;
 	newtp->rx_opt.mss_clamp = req->mss;
@@ -575,10 +582,11 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
 	__be32 flg = tcp_flag_word(th) & (TCP_FLAG_RST|TCP_FLAG_SYN|TCP_FLAG_ACK);
 	bool paws_reject = false;
 	bool own_req;
+	u8 *eno_opt = NULL;
 
 	tmp_opt.saw_tstamp = 0;
 	if (th->doff > (sizeof(struct tcphdr)>>2)) {
-		tcp_parse_options(sock_net(sk), skb, &tmp_opt, 0, NULL);
+		tcp_parse_options(sock_net(sk), skb, &tmp_opt, 0, NULL, &eno_opt);
 
 		if (tmp_opt.saw_tstamp) {
 			tmp_opt.ts_recent = req->ts_recent;
@@ -759,6 +767,16 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
 		inet_rsk(req)->acked = 1;
 		__NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPDEFERACCEPTDROP);
 		return NULL;
+	}
+
+	/* The ENO handshake is completed by the connection initiator sending an ACK
+	 * with an ENO option
+	 */
+	if (eno_opt) {
+		struct tcp_eno_info *eno = tcp_rsk(req)->eno_info; 
+		if (eno && eno->enabled) {
+			eno->established = 1;
+		}
 	}
 
 	/* OK, ACK is valid, create big socket and
